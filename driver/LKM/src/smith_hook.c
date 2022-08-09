@@ -88,6 +88,179 @@ void exit_protect_action(void)
 }
 #endif
 
+static void (*put_files_struct_sym) (struct files_struct * files);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
+
+static void smith_put_files_struct(struct files_struct *files)
+{
+    put_files_struct_sym(files);
+}
+
+static void smith_fput(struct file *filp)
+{
+    fput(filp);
+}
+
+static int __init smith_start_delayed_fput(void)
+{
+    return 0;
+}
+
+static void smith_stop_delayed_fput(void)
+{
+}
+
+#else /* < 3.6.0 */
+
+struct fput_node {
+    struct memcache_node cache;
+    struct fput_node *next;
+    union {
+        struct file *filp;
+        struct files_struct *files;
+    };
+    uint32_t flag_pool:1;
+    uint32_t type:8;  /* 0: file, 1: files */
+};
+
+struct memcache_head g_fput_root;
+
+static struct fput_node *smith_alloc_fput_node(void)
+{
+    struct memcache_node *mnod;
+
+    mnod = memcache_pop(&g_fput_root);
+    if (mnod) {
+        struct fput_node *fnod;
+        fnod = container_of(mnod, struct fput_node, cache);
+        fnod->flag_pool = 1;
+        return fnod;
+    }
+    return smith_kzalloc(sizeof(struct fput_node), GFP_ATOMIC);
+}
+
+static void smith_free_fput_node(struct fput_node *fnod)
+{
+    if (fnod->flag_pool)
+        memcache_push(&fnod->cache, &g_fput_root);
+    else
+        smith_kfree(fnod);
+}
+
+static struct task_struct *g_delayed_fput_thread;
+static struct fput_node *g_delayed_fput_queue;
+static spinlock_t g_delayed_fput_lock;
+
+static int smith_delayed_fput_worker(void *argv)
+{
+    struct fput_node *fnod;
+    unsigned long timeout = msecs_to_jiffies(1000 * 60);
+
+    do {
+        spin_lock(&g_delayed_fput_lock);
+        fnod = g_delayed_fput_queue;
+        if (fnod)
+            g_delayed_fput_queue = fnod->next;
+        spin_unlock(&g_delayed_fput_lock);
+
+        /* do actual file fput */
+        if (fnod) {
+            if (0 == fnod->type)
+                fput(fnod->filp);
+            else if (1 == fnod->type)
+                put_files_struct_sym(fnod->files);
+            smith_free_fput_node(fnod);
+        } else if (!kthread_should_stop()) {
+            /* restart to process next fnod if waken up */
+            if (schedule_timeout_interruptible(timeout))
+                continue;
+        }
+    } while (fnod || !kthread_should_stop());
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+    kthread_complete_and_exit(NULL, 0);
+#else
+    do_exit(0);
+#endif
+    return 0;
+}
+
+static int __init smith_start_delayed_fput(void)
+{
+    int nobjs = EXECVE_GET_SOCK_PID_LIMIT * EXECVE_GET_SOCK_FD_LIMIT;
+
+    spin_lock_init(&g_delayed_fput_lock);
+    g_delayed_fput_thread = kthread_create(smith_delayed_fput_worker, 0, "elkeid - fput");
+    if (IS_ERR(g_delayed_fput_thread)) {
+        int rc = g_delayed_fput_thread ? PTR_ERR(g_delayed_fput_thread) : -ENOMEM;
+        printk("smith_start_delayed_fput: failed creating dealyed_fput worker: %d\n", rc);
+        return rc;
+    }
+
+    /* initialize memory cache for fnod, errors to be ignored,
+       if fails, new node will be allocated from system slab */
+    memcache_init_pool(&g_fput_root, nobjs * num_possible_cpus(),
+                       sizeof(struct fput_node), 0, NULL, NULL);
+
+    return 0;
+}
+
+static void smith_stop_delayed_fput(void)
+{
+    /* kthread_stop will wait until worker thread exits */
+    if (!IS_ERR_OR_NULL(g_delayed_fput_thread)) {
+        kthread_stop(g_delayed_fput_thread);
+    }
+
+    if (g_delayed_fput_queue)
+        printk("BUG: opened file leaks found.\n");
+
+    memcache_fini(&g_fput_root, NULL, NULL);
+}
+
+static void smith_fput(struct file *filp)
+{
+    struct fput_node *fnod;
+
+    /* just loop until we get a new recrod */
+    do {
+        fnod = smith_alloc_fput_node();
+    } while (!fnod);
+
+    fnod->type = 0;
+    fnod->filp = filp;
+
+    /* attach fnod to deayed_fput_queue */
+    spin_lock(&g_delayed_fput_lock);
+    fnod->next = g_delayed_fput_queue;
+    g_delayed_fput_queue = fnod;
+    spin_unlock(&g_delayed_fput_lock);
+    wake_up_process(g_delayed_fput_thread);
+}
+
+static void smith_put_files_struct(struct files_struct *files)
+{
+    struct fput_node *fnod;
+
+    /* just loop until we get a new recrod */
+    do {
+        fnod = smith_alloc_fput_node();
+    } while (!fnod);
+
+    fnod->type = 1;
+    fnod->files = files;
+
+    /* attach fnod to deayed_fput_queue */
+    spin_lock(&g_delayed_fput_lock);
+    fnod->next = g_delayed_fput_queue;
+    g_delayed_fput_queue = fnod;
+    spin_unlock(&g_delayed_fput_lock);
+    wake_up_process(g_delayed_fput_thread);
+}
+
+#endif /* 3.6.0 */
+
 /*
  * task_lock() is required to avoid races with process termination
  */
@@ -102,12 +275,6 @@ static struct files_struct *smith_get_files_struct(struct task_struct *task)
     task_unlock(task);
 
     return files;
-}
-
-static void (*put_files_struct_sym) (struct files_struct * files);
-static void smith_put_files_struct(struct files_struct *files)
-{
-    put_files_struct_sym(files);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
@@ -282,7 +449,7 @@ static char *smith_get_file_path(int fd, char *buffer, int size)
         return buffer;
 
     path = smith_d_path(&filp->f_path, buffer, size);
-    fput(filp);
+    smith_fput(filp);
 
     return path;
 }
@@ -554,6 +721,9 @@ void get_process_socket(__be32 *sip4, struct in6_addr *sip6, int *sport,
             goto next_task;
 
         for (i = 0; i < EXECVE_GET_SOCK_FD_LIMIT; i++) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
+            struct file *filp;
+#endif
             struct socket *socket;
             int err = 0;
 
@@ -564,6 +734,10 @@ void get_process_socket(__be32 *sip4, struct in6_addr *sip6, int *sport,
                 rcu_read_unlock();
                 break;
             }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
+            /* grab extra ref to avoid fput issue for kernels < 3.6 */
+            filp = smith_fget_raw(i);
+#endif
             socket = sockfd_lookup(i, &err);
             rcu_read_unlock();
 
@@ -612,6 +786,10 @@ void get_process_socket(__be32 *sip4, struct in6_addr *sip6, int *sport,
 next_socket:
                 sockfd_put(socket);
             }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0)
+            if (filp)
+                smith_fput(filp);
+#endif
         }
         smith_put_files_struct(files);
 
@@ -898,7 +1076,7 @@ static int smith_trace_process_exec(struct execve_data *data, int rc)
     if (file) {
         stdin_buf = smith_kzalloc(256, GFP_ATOMIC);
         tmp_stdin = smith_d_path(&(file->f_path), stdin_buf, 256);
-        fput(file);
+        smith_fput(file);
     }
 
     // get stdout
@@ -906,7 +1084,7 @@ static int smith_trace_process_exec(struct execve_data *data, int rc)
     if (file) {
         stdout_buf = smith_kzalloc(256, GFP_ATOMIC);
         tmp_stdout = smith_d_path(&(file->f_path), stdout_buf, 256);
-        fput(file);
+        smith_fput(file);
     }
 
     pname_buf = smith_kzalloc(PATH_MAX, GFP_ATOMIC);
@@ -4535,14 +4713,21 @@ static int __init kprobe_hook_init(void)
 
     smith_init_systemd_ns();
 
-    /* need ROOT_MNT_NS inited by smith_init_systemd_ns */
-    ret = smith_tid_init();
+    ret = smith_start_delayed_fput();
     if (ret)
         return ret;
+
+    /* need ROOT_MNT_NS inited by smith_init_systemd_ns */
+    ret = smith_tid_init();
+    if (ret) {
+        smith_stop_delayed_fput();
+        return ret;
+    }
 
     ret = filter_init();
     if (ret) {
         smith_tid_fini();
+        smith_stop_delayed_fput();
         return ret;
     }
 
@@ -4578,6 +4763,7 @@ static void kprobe_hook_exit(void)
 
     /* cleaning up tid & img cache */
     smith_tid_fini();
+    smith_stop_delayed_fput();
 
     printk(KERN_INFO "[ELKEID] uninstall_kprobe success\n");
 }
