@@ -3783,7 +3783,7 @@ static char *smith_get_pid_tree(struct task_struct *task)
     snprintf(pid, 24, "%d", task->tgid);
     strcat(tree, pid);
     strcat(tree, ".");
-    strcat(tree, current->comm);
+    strncat(tree, task->comm, TASK_COMM_LEN);
 
     while (--n > 0) {
 
@@ -3799,7 +3799,7 @@ static char *smith_get_pid_tree(struct task_struct *task)
         strcat(tree, "<");
         strcat(tree, pid);
         strcat(tree, ".");
-        strcat(tree, task->comm);
+        strncat(tree, task->comm, TASK_COMM_LEN);
     }
 
 out:
@@ -3837,7 +3837,7 @@ static void smith_update_pid_tree(char *pid_tree, char *comm_new)
 static int smith_build_tid(struct smith_tid *tid, struct task_struct *task)
 {
     tid->st_start = smith_task_start_time(task);
-    tid->st_pid = task->pid;
+    tid->st_tgid = task->tgid;
     /* flags was already inited during allocation */
     tid->st_node.flag_newsid = smith_is_anchor(task->parent);
     tid->st_sid = task_session_nr_ns(task, &init_pid_ns);
@@ -3872,8 +3872,7 @@ static int smith_cmp_tid(struct hlist_root *hr, struct hlist_hnod *hnod, void *k
     struct smith_tid *tid;
 
     tid = container_of(hnod, struct smith_tid, st_node);
-    return !(tid->st_start == smith_task_start_time(task) &&
-             tid->st_pid == task->pid);
+    return (tid->st_tgid != task->tgid);
 }
 
 static void smith_release_tid(struct hlist_root *hr, struct hlist_hnod *hnod)
@@ -3905,8 +3904,8 @@ static void smith_show_tid(struct hlist_hnod *hnod)
         return;
 
     tid = container_of(hnod, struct smith_tid, st_node);
-    printk("pid: %u sid: %u task: %s mnt: %llu refs: %d\n",
-            tid->st_pid, tid->st_sid, tid->st_pid_tree,
+    printk("tgid: %u sid: %u task: %s mnt: %llu refs: %d\n",
+            tid->st_tgid, tid->st_sid, tid->st_pid_tree,
             tid->st_root, atomic_read(&tid->st_node.refs));
 }
 
@@ -3919,7 +3918,7 @@ void smith_enum_tid(void)
 static int smith_hash_tid(struct hlist_root *hr, void *key)
 {
     struct task_struct *task = key;
-    return (task->pid & hr->nlists);
+    return (task->tgid & hr->nlists);
 }
 
 static void smith_process_tasks(struct hlist_root *hr)
@@ -3931,6 +3930,9 @@ static void smith_process_tasks(struct hlist_root *hr)
     for_each_process(task) {
         /* skip kernel threads and tasks being shut donw */
         if (task->flags & (PF_KTHREAD | PF_EXITING))
+            continue;
+        /* only process group_leader */
+        if (task->pid != task->tgid)
             continue;
         hlist_insert_key_nolock(hr, task);
     }
@@ -3960,7 +3962,9 @@ TRACEPOINT_PROBE(smith_trace_proc_fork,
     /* skip kernel threads */
     if (task->flags & PF_KTHREAD)
         return;
-
+    /* only process group leader */
+    if (task->pid != task->tgid)
+        return;
     smith_insert_tid(task);
 }
 
@@ -4038,6 +4042,10 @@ TRACEPOINT_PROBE(smith_trace_proc_exit, struct task_struct *task)
     if (task->flags & PF_KTHREAD)
         return;
 
+    /* only process group leader */
+    if (task->pid != task->tgid)
+        return;
+
     /* try to cleanup current taks's tid record */
     smith_drop_tid(task);
 }
@@ -4049,6 +4057,10 @@ TRACEPOINT_PROBE(smith_trace_proc_exit, struct task_struct *task)
 TRACEPOINT_PROBE(smith_trace_sys_exit, struct pt_regs *regs, long ret)
 {
     long id = syscall_get_nr(current, regs);
+
+    /* ignore all kernel threads */
+    if (current->flags & PF_KTHREAD)
+        return;
 
 #if IS_ENABLED(CONFIG_IA32_EMULATION)
     /*
