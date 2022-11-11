@@ -720,6 +720,7 @@ static void smith_trace_sysret_bind(long sockfd, long ret)
     int sport = 0, err = 0;
 
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
     struct smith_tid *tid = NULL;
 
     /* ignore failed bind calls */
@@ -736,6 +737,7 @@ static void smith_trace_sysret_bind(long sockfd, long ret)
         // exe filter check
         if (execve_exe_check(exe_path))
             goto out;
+        pid_tree = tid->st_pid_tree;
     }
 
     if (AF_INET == sock->sk->sk_family) {
@@ -744,7 +746,7 @@ static void smith_trace_sysret_bind(long sockfd, long ret)
             goto out;
         sip4 = &sa.si4.sin_addr;
         sport = ntohs(sa.si4.sin_port);
-        bind_print(exe_path, sip4, sport, sockfd);
+        bind_print(exe_path, sip4, sport, sockfd, pid_tree);
 #if IS_ENABLED(CONFIG_IPV6)
     } else if (AF_INET6 == sock->sk->sk_family) {
         struct in6_addr *sip6;
@@ -753,7 +755,7 @@ static void smith_trace_sysret_bind(long sockfd, long ret)
             goto out;
         sip6 = &sa.si6.sin6_addr;
         sport = ntohs(sa.si6.sin6_port);
-        bind6_print(exe_path, sip6, sport, sockfd);
+        bind6_print(exe_path, sip6, sport, sockfd, pid_tree);
 #endif
     }
 
@@ -769,6 +771,7 @@ static void smith_trace_sysret_connect(long sockfd, int retval)
     struct socket *sock = NULL;
 
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
     struct smith_tid *tid = NULL;
 
     union {
@@ -790,6 +793,7 @@ static void smith_trace_sysret_connect(long sockfd, int retval)
         // exe filter check
         if (execve_exe_check(exe_path))
             goto out;
+        pid_tree = tid->st_pid_tree;
     }
 
     if (AF_INET == sock->sk->sk_family) {
@@ -804,7 +808,7 @@ static void smith_trace_sysret_connect(long sockfd, int retval)
             goto out;
         dip4 = sa.si4.sin_addr.s_addr;
         dport = ntohs(sa.si4.sin_port);
-        connect4_print(dport, dip4, exe_path, sip4, sport, retval);
+        connect4_print(dport, dip4, exe_path, sip4, sport, retval, pid_tree);
 
 #if IS_ENABLED(CONFIG_IPV6)
     } else if (AF_INET6 == sock->sk->sk_family) {
@@ -819,7 +823,7 @@ static void smith_trace_sysret_connect(long sockfd, int retval)
             goto out;
         dport = ntohs(sa.si6.sin6_port);
         dip6 = &sa.si6.sin6_addr;
-        connect6_print(dport, dip6, exe_path, &sip6, sport, retval);
+        connect6_print(dport, dip6, exe_path, &sip6, sport, retval, pid_tree);
 #endif
     }
 
@@ -1129,6 +1133,7 @@ int security_inode_create_pre_handler(struct kprobe *p, struct pt_regs *regs)
     struct smith_tid *tid = NULL;
     char *pathstr = DEFAULT_RET_STR;
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
     char *s_id = DEFAULT_RET_STR;
 
     struct dentry * file = NULL;
@@ -1141,6 +1146,7 @@ int security_inode_create_pre_handler(struct kprobe *p, struct pt_regs *regs)
         // exe filter check
         if (execve_exe_check(exe_path))
             goto out;
+        pid_tree = tid->st_pid_tree;
     }
 
     pname_buf = smith_kzalloc(PATH_MAX, GFP_ATOMIC);
@@ -1168,17 +1174,18 @@ int security_inode_create_pre_handler(struct kprobe *p, struct pt_regs *regs)
     if (sa_family == AF_INET) {
         security_inode4_create_print(exe_path, pathstr,
                                     dip4, dport, sip4, sport,
-                                    socket_pid, s_id);
+                                    socket_pid, s_id, pid_tree);
     }
 #if IS_ENABLED(CONFIG_IPV6)
     else if (sa_family == AF_INET6) {
 		security_inode6_create_print(exe_path, pathstr, &dip6,
                                      dport, &sip6, sport,
-			                         socket_pid, s_id);
+			                         socket_pid, s_id, pid_tree);
 	}
 #endif
     else {
-        security_inode_create_nosocket_print(exe_path, pathstr, s_id);
+        security_inode_create_nosocket_print(exe_path, pathstr,
+                                             s_id, pid_tree);
     }
 
 out:
@@ -1243,12 +1250,15 @@ static void dns_data_transport(char *query, __be32 dip, __be32 sip, int dport,
 {
     struct smith_tid *tid = NULL;
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
 
     tid = smith_lookup_tid(current);
-    if (tid)
+    if (tid) {
         exe_path = tid->st_img->si_path;
+        pid_tree = tid->st_pid_tree;
+    }
 
-    dns_print(dport, dip, exe_path, sip, sport, opcode, rcode, query, type);
+    dns_print(dport, dip, exe_path, sip, sport, opcode, rcode, query, type, pid_tree);
 
     if (tid)
         smith_put_tid(tid);
@@ -1261,12 +1271,15 @@ static void dns6_data_transport(char *query, struct in6_addr *dip,
 {
     struct smith_tid *tid = NULL;
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
 
     tid = smith_lookup_tid(current);
-    if (tid)
+    if (tid) {
         exe_path = tid->st_img->si_path;
+        pid_tree = tid->st_pid_tree;
+    }
 
-    dns6_print(dport, dip, exe_path, sip, sport, opcode, rcode, query, type);
+    dns6_print(dport, dip, exe_path, sip, sport, opcode, rcode, query, type, pid_tree);
 
     if (tid)
         smith_put_tid(tid);
@@ -1839,6 +1852,7 @@ int link_pre_handler(struct kprobe *p, struct pt_regs *regs)
 static void smith_trace_sysret_setsid(int ret)
 {
     char *exe_path = DEFAULT_RET_STR;
+    char *pid_tree = NULL;
     struct smith_tid *tid = NULL;
 
     tid = smith_lookup_tid(current);
@@ -1847,9 +1861,10 @@ static void smith_trace_sysret_setsid(int ret)
         // exe filter check
         if (execve_exe_check(exe_path))
             goto out;
+        pid_tree = tid->st_pid_tree;
     }
 
-    setsid_print(exe_path, ret);
+    setsid_print(exe_path, ret, pid_tree);
 
 out:
     if (tid)
